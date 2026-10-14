@@ -27,7 +27,7 @@ Item {
     readonly property bool minimal: !pickerPhase && style === "minimal"
     readonly property string profileVisibility: cfg.profileVisibility ?? (cfg.showProfileImage === false ? "never" : "always")
     readonly property string passwordVisibility: cfg.passwordVisibility ?? (cfg.showPasswordField === false ? "typing" : "always")
-    readonly property bool authenticating: Greetd.state !== GreetdState.Inactive && !(host?.awaitingExternalAuth ?? false) && !(host?.pendingPasswordResponse ?? false)
+    readonly property bool authenticating: Greetd.state !== GreetdState.Inactive && !(host?.awaitingExternalAuth ?? false) && !(host?.pendingPasswordResponse ?? false) && !(host?.promptOnlySession ?? false)
     readonly property bool failed: GreeterState.pamState !== ""
     readonly property bool inputVisible: !GreeterState.showPasswordInput || passwordVisibility !== "typing" || GreeterState.passwordBuffer.length > 0 || authenticating || GreeterState.unlocking || failed
     readonly property bool pickerAvailable: host?.pickerAvailable ?? false
@@ -548,9 +548,14 @@ Item {
                         if (syncingFromState)
                             return;
                         if (GreeterState.showPasswordInput) {
+                            const wasEmpty = GreeterState.passwordBuffer.length === 0;
                             GreeterState.passwordBuffer = text;
                             if (!text || text.length === 0)
                                 root.host.passwordSubmitRequested = false;
+                            else if (wasEmpty && Greetd.state === GreetdState.Inactive)
+                                // typing is a request, so it opens a session even where the
+                                // auto-start fuse has blown
+                                root.host.startAuthSession(false);
                         } else {
                             GreeterState.usernameInput = text;
                         }
