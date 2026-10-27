@@ -10,6 +10,7 @@ import qs.Services
 import qs.Widgets
 import qs.DCommon.Session
 import "../../DCommon/Common/LayoutCodes.js" as LayoutCodes
+import "PamGate.js" as PamGate
 
 Item {
     id: root
@@ -99,6 +100,9 @@ Item {
     property bool passwordSubmitRequested: false
     // session opened only to learn the prompt - nothing has been submitted yet
     property bool promptOnlySession: false
+    // createSession() is answered over IPC, so Greetd.state lags the request by a
+    // tick or two. Without this, two callers in the same pass both see Inactive.
+    property bool sessionRequested: false
     // stops a stack that completes without ever prompting from being reopened forever.
     // It covers the sessions nobody asked for; typing or submitting always opens one.
     property int autoStartCount: 0
@@ -118,6 +122,7 @@ Item {
     property string systemLocalLoginPamText: ""
     property string commonAuthPcPamText: ""
     property string loginPamText: ""
+    property string postloginPamText: ""
     property string faillockConfigText: ""
     property string authAutoStartedForUser: ""
     property bool fprintdProbeComplete: false
@@ -211,6 +216,23 @@ Item {
         }
         return false;
     }
+
+    readonly property var includedPamStackTexts: ({
+            "system-auth": systemAuthPamText,
+            "common-auth": commonAuthPamText,
+            "password-auth": passwordAuthPamText,
+            "system-login": systemLoginPamText,
+            "system-local-login": systemLocalLoginPamText,
+            "common-auth-pc": commonAuthPcPamText,
+            "login": loginPamText,
+            "postlogin": postloginPamText
+        })
+
+    // Null while any part of the stack could not be read; see PamGate.js.
+    readonly property var greeterAuthLines: PamGate.resolveAuthLines(greetdPamText, includedPamStackTexts)
+    readonly property var greeterUnvettedAuthModules: PamGate.unvettedModules(greeterAuthLines)
+    // Whether opening the conversation only buys the prompt and nothing else.
+    readonly property bool greeterPamPromptOnly: PamGate.isPromptOnly(greeterAuthLines)
 
     function greeterPamStackHasModule(moduleName) {
         if (pamModuleEnabled(greetdPamText, moduleName))
@@ -378,7 +400,7 @@ Item {
         onLoaded: {
             root.greetdPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.greetdPamText = "";
@@ -393,11 +415,24 @@ Item {
         onLoaded: {
             root.systemAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.systemAuthPamText = "";
             root.refreshPasswordAttemptPolicyHint();
+        }
+    }
+
+    FileView {
+        id: postloginPamWatcher
+        path: "/etc/pam.d/postlogin"
+        printErrors: false
+        onLoaded: {
+            root.postloginPamText = text();
+            root.scheduleAutoStartAuthSession();
+        }
+        onLoadFailed: {
+            root.postloginPamText = "";
         }
     }
 
@@ -408,7 +443,7 @@ Item {
         onLoaded: {
             root.commonAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.commonAuthPamText = "";
@@ -423,7 +458,7 @@ Item {
         onLoaded: {
             root.passwordAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.passwordAuthPamText = "";
@@ -438,7 +473,7 @@ Item {
         onLoaded: {
             root.systemLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.systemLoginPamText = "";
@@ -453,7 +488,7 @@ Item {
         onLoaded: {
             root.systemLocalLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.systemLocalLoginPamText = "";
@@ -468,7 +503,7 @@ Item {
         onLoaded: {
             root.commonAuthPcPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.commonAuthPcPamText = "";
@@ -483,7 +518,7 @@ Item {
         onLoaded: {
             root.loginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onLoadFailed: {
             root.loginPamText = "";
@@ -642,10 +677,20 @@ Item {
             }
             return;
         }
+        if (sessionRequested) {
+            // a create is already on its way; let it carry the submit
+            if (submitPassword) {
+                promptOnlySession = false;
+                passwordSubmitRequested = true;
+            }
+            return;
+        }
         pendingPasswordResponse = false;
         passwordSubmitRequested = submitPassword;
         promptOnlySession = !submitPassword;
         awaitingExternalAuth = !submitPassword && !hasPasswordBuffer && root.greeterExternalAuthAvailable;
+        sessionRequested = true;
+        sessionRequestTimeout.restart();
         Greetd.createSession(GreeterState.username);
     }
 
@@ -655,12 +700,26 @@ Item {
     // happened for fprint/u2f/face stacks; a password or PIN stack is no different.
     // Nothing is submitted, so no attempt is consumed. This is the path nobody asked
     // for, so it is the one the autoStartCount fuse limits.
+    // Eight PAM files and a fprintd probe all finish into this, several of them in
+    // the same pass. Coalescing them means one session gets opened, not one per
+    // file that happened to land first.
+    function scheduleAutoStartAuthSession() {
+        autoStartTimer.restart();
+    }
+
     function maybeAutoStartAuthSession() {
         if (!GreeterState.showPasswordInput || !GreeterState.username)
             return;
-        if (GreeterState.unlocking || Greetd.state !== GreetdState.Inactive)
+        if (GreeterState.unlocking || Greetd.state !== GreetdState.Inactive || sessionRequested)
             return;
         if (passwordSubmitRequested)
+            return;
+        // Opening a conversation runs every module in the stack. On a face or
+        // fingerprint stack that is the point, and it is what this function always
+        // did. On a stack that can answer by itself some other way - a token, an
+        // agent, a push to a phone - it would log someone in, or pester them, for a
+        // request nobody made, so there the conversation waits for a submit.
+        if (!root.greeterExternalAuthAvailable && !root.greeterPamPromptOnly)
             return;
         if (GreeterState.passwordBuffer && GreeterState.passwordBuffer.length > 0)
             return;
@@ -733,12 +792,12 @@ Item {
                     return; // PAM-only fallback stays active
                 root.fprintdHasDevice = text.includes("objectpath");
                 root.fprintdProbeComplete = true;
-                root.maybeAutoStartAuthSession();
+                root.scheduleAutoStartAuthSession();
             }
         }
         onExited: function (exitCode, exitStatus) {
             if (!root.fprintdProbeComplete)
-                root.maybeAutoStartAuthSession(); // PAM-only fallback stays active
+                root.scheduleAutoStartAuthSession(); // PAM-only fallback stays active
         }
     }
 
@@ -1124,6 +1183,9 @@ Item {
         }
 
         function onStateChanged() {
+            // the request has been answered, whichever way it went
+            sessionRequested = false;
+            sessionRequestTimeout.stop();
             if (Greetd.state === GreetdState.Inactive) {
                 awaitingExternalAuth = false;
                 pendingPasswordResponse = false;
@@ -1229,6 +1291,22 @@ Item {
             const launchArgs = needsVoidDbusSession ? ["dbus-run-session"].concat(sessionArgs) : sessionArgs;
             Greetd.launch(launchArgs, launchEnv);
         }
+    }
+
+    Timer {
+        id: autoStartTimer
+
+        interval: 0
+        onTriggered: root.maybeAutoStartAuthSession()
+    }
+
+    // If greetd never answers a createSession, the in-flight flag must not be what
+    // stops the user from logging in: release it and let the next keystroke retry.
+    Timer {
+        id: sessionRequestTimeout
+
+        interval: 3000
+        onTriggered: root.sessionRequested = false
     }
 
     Timer {
