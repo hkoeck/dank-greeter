@@ -20,6 +20,8 @@ Singleton {
     property bool pendingPasswordResponse: false
     property bool passwordSubmitRequested: false
     property string authPromptText: ""
+    // a session opened only to learn the prompt - nothing has been submitted yet
+    property bool promptOnlySession: false
     property string authFeedbackMessage: ""
 
     property var sessionList: []

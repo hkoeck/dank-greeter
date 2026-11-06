@@ -111,7 +111,12 @@ Item {
     property string commonAuthPcPamText: ""
     property string loginPamText: ""
     property string faillockConfigText: ""
-    property string externalAuthAutoStartedForUser: ""
+    property string authAutoStartedForUser: ""
+    // stops a stack that completes without ever prompting from being reopened
+    // forever. It covers the sessions nobody asked for; typing or submitting
+    // always opens one.
+    property int autoStartCount: 0
+    readonly property int maxAutoStarts: 3
     property bool fprintdProbeComplete: false
     property bool fprintdHasDevice: false
     property bool autoLoginOnSuccess: false
@@ -135,6 +140,8 @@ Item {
             return I18n.tr("Awaiting face authentication");
         return I18n.tr("Awaiting security key authentication");
     }
+    // the placeholder is hidden once the field has text, so a waiting prompt is shown below
+    readonly property string authPromptDisplay: (GreeterState.authPromptText !== "" && GreeterState.pendingPasswordResponse && !GreeterState.passwordSubmitRequested && GreeterState.passwordBuffer.length > 0) ? GreeterState.authPromptText : ""
     readonly property string authDisplayMessage: GreeterState.authFeedbackMessage || externalAuthStatusMessage
     readonly property bool autoLoginAvailable: GreetdSettings.rememberLastUser && GreetdSettings.rememberLastSession
     readonly property bool multipleUsersAvailable: GreeterUsersService.loaded && GreeterUsersService.users.length > 1
@@ -396,7 +403,7 @@ Item {
         onLoaded: {
             root.greetdPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.greetdPamText = "";
@@ -410,7 +417,7 @@ Item {
         onLoaded: {
             root.systemAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.systemAuthPamText = "";
@@ -424,7 +431,7 @@ Item {
         onLoaded: {
             root.commonAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.commonAuthPamText = "";
@@ -438,7 +445,7 @@ Item {
         onLoaded: {
             root.passwordAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.passwordAuthPamText = "";
@@ -452,7 +459,7 @@ Item {
         onLoaded: {
             root.systemLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.systemLoginPamText = "";
@@ -466,7 +473,7 @@ Item {
         onLoaded: {
             root.systemLocalLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.systemLocalLoginPamText = "";
@@ -480,7 +487,7 @@ Item {
         onLoaded: {
             root.commonAuthPcPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.commonAuthPcPamText = "";
@@ -494,7 +501,7 @@ Item {
         onLoaded: {
             root.loginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartExternalAuth();
+            root.maybeAutoStartAuthSession();
         }
         onMissing: {
             root.loginPamText = "";
@@ -582,7 +589,7 @@ Item {
         GreeterState.sessionManuallySelected = false;
         clearAuthFeedback();
         passwordFailureCount = 0;
-        externalAuthAutoStartedForUser = "";
+        authAutoStartedForUser = "";
         if (Greetd.state !== GreetdState.Inactive)
             Greetd.cancelSession();
         const previousUser = GreeterState.username;
@@ -611,7 +618,7 @@ Item {
         if (userChanged) {
             passwordFailureCount = 0;
             clearAuthFeedback();
-            externalAuthAutoStartedForUser = "";
+            authAutoStartedForUser = "";
         }
         root.pickerThemeUsername = user;
         GreeterState.username = user;
@@ -623,18 +630,18 @@ Item {
         GreeterState.passwordBuffer = "";
         GreeterState.pendingPasswordResponse = false;
         GreeterState.passwordSubmitRequested = false;
-        maybeAutoStartExternalAuth();
+        maybeAutoStartAuthSession();
     }
 
     function submitBufferedPassword() {
         GreeterState.pendingPasswordResponse = false;
         GreeterState.passwordSubmitRequested = false;
+        GreeterState.promptOnlySession = false;
         GreeterState.awaitingExternalAuth = false;
         // Some PAM stacks expect an explicit empty response to advance U2F/fprint or fail normally.
         Greetd.respond(GreeterState.passwordBuffer || "");
         GreeterState.passwordBuffer = "";
         root.clearInput();
-        return true;
     }
 
     function startAuthSession(submitPassword) {
@@ -645,24 +652,31 @@ Item {
             return;
         const hasPasswordBuffer = GreeterState.passwordBuffer && GreeterState.passwordBuffer.length > 0;
         if (Greetd.state !== GreetdState.Inactive) {
-            if (GreeterState.pendingPasswordResponse && submitPassword)
+            if (GreeterState.pendingPasswordResponse && submitPassword) {
                 submitBufferedPassword();
-            else if (submitPassword)
+            } else if (submitPassword) {
+                // an answer is waiting for the prompt that will carry it, so the session
+                // is no longer open only to learn it - the screen has to say it is working
+                GreeterState.promptOnlySession = false;
                 GreeterState.passwordSubmitRequested = true;
+            }
             return;
         }
-        if (!submitPassword && !hasPasswordBuffer && !root.greeterExternalAuthAvailable)
-            return;
         GreeterState.pendingPasswordResponse = false;
         GreeterState.passwordSubmitRequested = submitPassword;
+        GreeterState.promptOnlySession = !submitPassword;
         GreeterState.awaitingExternalAuth = !submitPassword && !hasPasswordBuffer && root.greeterExternalAuthAvailable;
         Greetd.createSession(GreeterState.username);
     }
 
-    function maybeAutoStartExternalAuth() {
+    // Open the conversation as soon as a user is known, like hyprlock's auth thread and
+    // gnome's unlock dialog: pam is asked, the first prompt is held unanswered, and the
+    // field shows what it really asked for instead of guessing "Password". This already
+    // happened for fprint/u2f/face stacks; a password or PIN stack is no different.
+    // Nothing is submitted, so no attempt is consumed. This is the path nobody asked
+    // for, so it is the one the autoStartCount fuse limits.
+    function maybeAutoStartAuthSession() {
         if (!GreeterState.showPasswordInput || !GreeterState.username)
-            return;
-        if (!root.greeterExternalAuthAvailable)
             return;
         if (GreeterState.unlocking || Greetd.state !== GreetdState.Inactive)
             return;
@@ -670,10 +684,13 @@ Item {
             return;
         if (GreeterState.passwordBuffer && GreeterState.passwordBuffer.length > 0)
             return;
-        if (externalAuthAutoStartedForUser === GreeterState.username)
+        if (authAutoStartedForUser !== GreeterState.username) {
+            authAutoStartedForUser = GreeterState.username;
+            autoStartCount = 0;
+        }
+        if (autoStartCount >= maxAutoStarts)
             return;
-
-        externalAuthAutoStartedForUser = GreeterState.username;
+        autoStartCount = autoStartCount + 1;
         startAuthSession(false);
     }
 
@@ -736,12 +753,12 @@ Item {
                     return; // PAM-only fallback stays active
                 root.fprintdHasDevice = text.includes("objectpath");
                 root.fprintdProbeComplete = true;
-                root.maybeAutoStartExternalAuth();
+                root.maybeAutoStartAuthSession();
             }
         }
         onExited: function (exitCode, exitStatus) {
             if (!root.fprintdProbeComplete)
-                root.maybeAutoStartExternalAuth(); // PAM-only fallback stays active
+                root.maybeAutoStartAuthSession(); // PAM-only fallback stays active
         }
     }
 
@@ -1122,11 +1139,15 @@ Item {
             if (responseRequired) {
                 GreeterState.awaitingExternalAuth = false;
                 GreeterState.pendingPasswordResponse = true;
-                const hasPasswordBuffer = GreeterState.passwordBuffer && GreeterState.passwordBuffer.length > 0;
-                if (!GreeterState.passwordSubmitRequested && hasPasswordBuffer)
-                    GreeterState.passwordSubmitRequested = true;
-                if (GreeterState.passwordSubmitRequested && !root.submitBufferedPassword())
-                    GreeterState.passwordSubmitRequested = false;
+                // a prompt that arrives is proof the stack works, so the restart fuse resets
+                autoStartCount = 0;
+                // whatever it was opened for, it has stopped being a session that only
+                // waits for its first prompt
+                GreeterState.promptOnlySession = false;
+                // each prompt needs its own submission, or it is answered with whatever
+                // happened to be typed when it arrived
+                if (GreeterState.passwordSubmitRequested)
+                    root.submitBufferedPassword();
                 return;
             }
             GreeterState.pendingPasswordResponse = false;
@@ -1138,8 +1159,11 @@ Item {
             if (Greetd.state === GreetdState.Inactive) {
                 GreeterState.awaitingExternalAuth = false;
                 GreeterState.pendingPasswordResponse = false;
+                GreeterState.promptOnlySession = false;
                 GreeterState.authPromptText = "";
                 GreeterState.passwordSubmitRequested = false;
+                // the next attempt needs its own conversation to learn the prompt from
+                authRestartTimer.restart();
             }
         }
 
@@ -1189,6 +1213,7 @@ Item {
             GreeterState.awaitingExternalAuth = false;
             GreeterState.pendingPasswordResponse = false;
             GreeterState.passwordSubmitRequested = false;
+            GreeterState.promptOnlySession = false;
             launchTimeout.stop();
             GreeterState.unlocking = false;
             if (isLikelyLockoutMessage(message)) {
@@ -1210,6 +1235,7 @@ Item {
             GreeterState.awaitingExternalAuth = false;
             GreeterState.pendingPasswordResponse = false;
             GreeterState.passwordSubmitRequested = false;
+            GreeterState.promptOnlySession = false;
             launchTimeout.stop();
             GreeterState.unlocking = false;
             GreeterState.pamState = "error";
@@ -1238,6 +1264,13 @@ Item {
             const needsVoidDbusSession = Quickshell.env("DMS_VOID") === "1" && !Quickshell.env("DBUS_SESSION_BUS_ADDRESS") && sessionArgs[0] !== "dbus-run-session";
             Greetd.launch(needsVoidDbusSession ? ["dbus-run-session"].concat(launchArgs) : launchArgs, launchEnv);
         }
+    }
+
+    Timer {
+        id: authRestartTimer
+
+        interval: 150
+        onTriggered: root.maybeAutoStartAuthSession()
     }
 
     Timer {
