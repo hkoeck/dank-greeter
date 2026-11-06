@@ -13,7 +13,7 @@ DATA_DIR=$(PREFIX)/share
 SHELL_DIR=quickshell
 ASSETS_DIR=assets
 
-.PHONY: all build dev run clean test fmt vet update-common i18n-extract i18n-local i18n-test i18n-push i18n-sync i18n-check install install-bin uninstall uninstall-bin help
+.PHONY: all build dev run clean test test-qml fmt vet update-common i18n-extract i18n-local i18n-test i18n-push i18n-sync i18n-check install install-bin uninstall uninstall-bin help
 
 all: build
 
@@ -31,6 +31,11 @@ clean:
 
 test:
 	@$(MAKE) -C $(CORE_DIR) test
+	@$(MAKE) test-qml
+
+# Logic that QML imports from a .js library, run under node
+test-qml:
+	@node --test $(SHELL_DIR)/tests/*.test.mjs
 
 fmt:
 	@$(MAKE) -C $(CORE_DIR) fmt
@@ -83,7 +88,7 @@ help:
 	@echo "  build              - Build the dms-greeter binary (release flags, UI embedded)"
 	@echo "  dev                - Fast development build"
 	@echo "  run                - Build and preview the greeter against the in-repo quickshell config"
-	@echo "  clean / test / fmt / vet"
+	@echo "  clean / test / test-qml / fmt / vet"
 	@echo "  update-common      - Bump the dux-qml-common submodule + flake input"
 	@echo "  i18n-extract       - Regenerate translations/en.json from I18n.tr() calls"
 	@echo "  i18n-local         - Re-extract and show added/removed terms (no POEditor)"

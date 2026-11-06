@@ -10,6 +10,7 @@ import qs.Services
 import qs.Widgets
 import qs.DCommon.Session
 import "../../DCommon/Common/LayoutCodes.js" as LayoutCodes
+import "PamGate.js" as PamGate
 
 Item {
     id: root
@@ -110,6 +111,7 @@ Item {
     property string systemLocalLoginPamText: ""
     property string commonAuthPcPamText: ""
     property string loginPamText: ""
+    property string postloginPamText: ""
     property string faillockConfigText: ""
     property string authAutoStartedForUser: ""
     // createSession() is answered over IPC, so Greetd.state lags the request by a
@@ -195,6 +197,23 @@ Item {
             return trimmed.substring(0, hashIdx).trim();
         return trimmed;
     }
+
+    readonly property var includedPamStackTexts: ({
+            "system-auth": systemAuthPamText,
+            "common-auth": commonAuthPamText,
+            "password-auth": passwordAuthPamText,
+            "system-login": systemLoginPamText,
+            "system-local-login": systemLocalLoginPamText,
+            "common-auth-pc": commonAuthPcPamText,
+            "login": loginPamText,
+            "postlogin": postloginPamText
+        })
+
+    // Null while any part of the stack could not be read; see PamGate.js.
+    readonly property var greeterAuthLines: PamGate.resolveAuthLines(greetdPamText, includedPamStackTexts)
+    readonly property var greeterUnvettedAuthModules: PamGate.unvettedModules(greeterAuthLines)
+    // Whether opening the conversation only buys the prompt and nothing else.
+    readonly property bool greeterPamPromptOnly: PamGate.isPromptOnly(greeterAuthLines)
 
     function pamModuleEnabled(pamText, moduleName) {
         if (!pamText || !moduleName)
@@ -411,6 +430,18 @@ Item {
         onMissing: {
             root.greetdPamText = "";
             root.refreshPasswordAttemptPolicyHint();
+        }
+    }
+
+    PamServiceFile {
+        id: postloginPamWatcher
+        service: "postlogin"
+        onLoaded: {
+            root.postloginPamText = text();
+            root.scheduleAutoStartAuthSession();
+        }
+        onMissing: {
+            root.postloginPamText = "";
         }
     }
 
@@ -709,6 +740,13 @@ Item {
             autoStartCount = 0;
         }
         if (autoStartCount >= maxAutoStarts)
+            return;
+        // Opening a conversation runs every module in the stack. On a face or
+        // fingerprint stack that is the point, and it is what this function always
+        // did. On a stack that can answer by itself some other way - a token, an
+        // agent, a push to a phone - it would log someone in, or pester them, for a
+        // request nobody made, so there the conversation waits for a submit.
+        if (!root.greeterExternalAuthAvailable && !root.greeterPamPromptOnly)
             return;
         autoStartCount = autoStartCount + 1;
         startAuthSession(false);
