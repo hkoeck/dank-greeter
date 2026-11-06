@@ -112,6 +112,9 @@ Item {
     property string loginPamText: ""
     property string faillockConfigText: ""
     property string authAutoStartedForUser: ""
+    // createSession() is answered over IPC, so Greetd.state lags the request by a
+    // tick or two. Without this, two callers in the same pass both see Inactive.
+    property bool sessionRequested: false
     // stops a stack that completes without ever prompting from being reopened
     // forever. It covers the sessions nobody asked for; typing or submitting
     // always opens one.
@@ -403,7 +406,7 @@ Item {
         onLoaded: {
             root.greetdPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.greetdPamText = "";
@@ -417,7 +420,7 @@ Item {
         onLoaded: {
             root.systemAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.systemAuthPamText = "";
@@ -431,7 +434,7 @@ Item {
         onLoaded: {
             root.commonAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.commonAuthPamText = "";
@@ -445,7 +448,7 @@ Item {
         onLoaded: {
             root.passwordAuthPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.passwordAuthPamText = "";
@@ -459,7 +462,7 @@ Item {
         onLoaded: {
             root.systemLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.systemLoginPamText = "";
@@ -473,7 +476,7 @@ Item {
         onLoaded: {
             root.systemLocalLoginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.systemLocalLoginPamText = "";
@@ -487,7 +490,7 @@ Item {
         onLoaded: {
             root.commonAuthPcPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.commonAuthPcPamText = "";
@@ -501,7 +504,7 @@ Item {
         onLoaded: {
             root.loginPamText = text();
             root.refreshPasswordAttemptPolicyHint();
-            root.maybeAutoStartAuthSession();
+            root.scheduleAutoStartAuthSession();
         }
         onMissing: {
             root.loginPamText = "";
@@ -662,11 +665,28 @@ Item {
             }
             return;
         }
+        if (sessionRequested) {
+            // a create is already on its way; let it carry the submit
+            if (submitPassword) {
+                GreeterState.promptOnlySession = false;
+                GreeterState.passwordSubmitRequested = true;
+            }
+            return;
+        }
         GreeterState.pendingPasswordResponse = false;
         GreeterState.passwordSubmitRequested = submitPassword;
         GreeterState.promptOnlySession = !submitPassword;
         GreeterState.awaitingExternalAuth = !submitPassword && !hasPasswordBuffer && root.greeterExternalAuthAvailable;
+        sessionRequested = true;
+        sessionRequestTimeout.restart();
         Greetd.createSession(GreeterState.username);
+    }
+
+    // Eight PAM files and a fprintd probe all finish into this, several of them in
+    // the same pass. Coalescing them means one session gets opened, not one per
+    // file that happened to land first.
+    function scheduleAutoStartAuthSession() {
+        autoStartTimer.restart();
     }
 
     // Open the conversation as soon as a user is known, like hyprlock's auth thread and
@@ -678,7 +698,7 @@ Item {
     function maybeAutoStartAuthSession() {
         if (!GreeterState.showPasswordInput || !GreeterState.username)
             return;
-        if (GreeterState.unlocking || Greetd.state !== GreetdState.Inactive)
+        if (GreeterState.unlocking || Greetd.state !== GreetdState.Inactive || sessionRequested)
             return;
         if (GreeterState.passwordSubmitRequested)
             return;
@@ -753,12 +773,12 @@ Item {
                     return; // PAM-only fallback stays active
                 root.fprintdHasDevice = text.includes("objectpath");
                 root.fprintdProbeComplete = true;
-                root.maybeAutoStartAuthSession();
+                root.scheduleAutoStartAuthSession();
             }
         }
         onExited: function (exitCode, exitStatus) {
             if (!root.fprintdProbeComplete)
-                root.maybeAutoStartAuthSession(); // PAM-only fallback stays active
+                root.scheduleAutoStartAuthSession(); // PAM-only fallback stays active
         }
     }
 
@@ -1156,6 +1176,9 @@ Item {
         }
 
         function onStateChanged() {
+            // the request has been answered, whichever way it went
+            sessionRequested = false;
+            sessionRequestTimeout.stop();
             if (Greetd.state === GreetdState.Inactive) {
                 GreeterState.awaitingExternalAuth = false;
                 GreeterState.pendingPasswordResponse = false;
@@ -1264,6 +1287,22 @@ Item {
             const needsVoidDbusSession = Quickshell.env("DMS_VOID") === "1" && !Quickshell.env("DBUS_SESSION_BUS_ADDRESS") && sessionArgs[0] !== "dbus-run-session";
             Greetd.launch(needsVoidDbusSession ? ["dbus-run-session"].concat(launchArgs) : launchArgs, launchEnv);
         }
+    }
+
+    Timer {
+        id: autoStartTimer
+
+        interval: 0
+        onTriggered: root.maybeAutoStartAuthSession()
+    }
+
+    // If greetd never answers a createSession, the in-flight flag must not be what
+    // stops the user from logging in: release it and let the next keystroke retry.
+    Timer {
+        id: sessionRequestTimeout
+
+        interval: 3000
+        onTriggered: root.sessionRequested = false
     }
 
     Timer {
