@@ -628,6 +628,7 @@ Item {
 
     function startAuthSession(submitPassword) {
         submitPassword = submitPassword === true;
+        console.log('[fp-trace] startAuthSession submit=' + submitPassword + ' extAvail=' + root.greeterExternalAuthAvailable + ' hasFprint=' + root.greeterPamHasFprint + ' stackFprint=' + root.greeterPamStackHasFprint + ' probeDone=' + root.fprintdProbeComplete + ' hasDev=' + root.fprintdHasDevice + ' enableFprint=' + SettingsData.greeterEnableFprint + ' greetdState=' + Greetd.state);
         if (!GreeterState.showPasswordInput || !GreeterState.username)
             return;
         if (GreeterState.unlocking)
@@ -1054,6 +1055,7 @@ Item {
         enabled: isPrimaryScreen
 
         function onAuthMessage(message, error, responseRequired, echoResponse) {
+            console.log('[fp-trace] onAuthMessage msg=' + JSON.stringify(message) + ' err=' + error + ' respReq=' + responseRequired);
             authPromptText = responseRequired ? (message || "").replace(/:\s*$/, "").trim() : "";
             if (responseRequired) {
                 awaitingExternalAuth = false;
@@ -1085,6 +1087,7 @@ Item {
         }
 
         function onStateChanged() {
+            console.log('[fp-trace] greetd state=' + Greetd.state);
             if (Greetd.state === GreetdState.Inactive) {
                 awaitingExternalAuth = false;
                 pendingPasswordResponse = false;
